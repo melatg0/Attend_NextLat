@@ -1,0 +1,38 @@
+Attend-NextLat implementation notes
+===================================
+
+Why:
+The original NextLat predicts its next latent state with one MLP from
+(current hidden state, next-token embedding). This experiment tests whether
+separate, token-conditioned attention-head updates and a learned gate form
+a better inductive bias for latent dynamics and long-horizon consistency.
+
+What changed:
+- models/model_gpt.py: CausalSelfAttention/Block optionally return per-head
+  outputs before the attention output projection; existing callers are unchanged.
+- models/model_nextlat.py: opt-in HeadSpecificDynamicsModel has an independent
+  MLP per final-layer attention head, a shared next-token projection, softmax
+  gating (or uniform weights), a combining MLP, and a residual state update.
+  First-step dynamics use actual head outputs. Later rollout steps project
+  predicted latent states into proxy head features, avoiding new transformer
+  passes. Training returns extra head activations and propagates their gradients
+  back into the transformer. NextLat CE, Smooth L1, and KL losses are retained.
+- core_train.py and defaults.yaml: expose head_specific_dynamics (default false)
+  and head_uniform_gate (default false) to experiments. The original NextLat
+  baseline stays selectable without code changes.
+
+How to use:
+Set use_nextlat: true and model.head_specific_dynamics: true in a copied YAML
+training configuration. Use model.head_uniform_gate: true for the no-learned-gate
+ablation. To reproduce the baseline, set head_specific_dynamics: false.
+Run via the repository's usual scripts/train.py commands; keep compile: false
+until the uncompiled model has been validated.
+
+Limitations and checks:
+- Projected head features after the first step are learned proxies, not actual
+  future attention outputs. Their usefulness must be evaluated.
+- Predictor parameter count is approximately matched by selecting the combining
+  MLP's width; record exact parameter counts per experimental configuration.
+- This commit changes architecture and configuration only; it does not prove
+  better accuracy, equal FLOPs, or runtime feasibility. Run smoke tests, then
+  compare baseline/learned/uniform gating with the same seeds and horizons.
