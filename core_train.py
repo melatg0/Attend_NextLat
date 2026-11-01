@@ -92,6 +92,8 @@ def initialize_model(
             "lambda_mse": config.model.lambda_mse,
             "lambda_ce": config.model.lambda_ce,
             "proj_factor": config.model.proj_factor,
+            "head_specific_dynamics": config.model.head_specific_dynamics,
+            "head_uniform_gate": config.model.head_uniform_gate,
             "compute_hidden_state_rank": config.model.compute_hidden_state_rank,
         }
     elif config.use_mtp_gloeckle:
