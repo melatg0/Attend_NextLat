@@ -42,6 +42,8 @@ class NextLatConfig:
     lambda_ce: float = 0.0  # optional CE loss on next-next-token prediction
     mtp_horizon: int = 1  # multi-step prediction horizon (d) in the paper
     proj_factor: float = 1.0  # projection factor in the latent dynamics model MLP
+    head_specific_dynamics: bool = False  # opt-in Attend-NextLat predictor
+    head_uniform_gate: bool = False  # ablation: replace learned weights with 1/n_head
 
 
 class NextLatDynamicsModel(nn.Module):
@@ -95,6 +97,101 @@ class NextLatDynamicsModel(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+
+class HeadSpecificDynamicsModel(nn.Module):
+    """
+    Token-conditioned, per-head latent transition model.
+
+    At the first step, head_features are the last transformer's attention outputs
+    BEFORE the attention output projection. For later steps, a learned projection
+    of the predicted latent state supplies proxy head features; this avoids any
+    additional transformer forward passes during recursive rollout.
+    """
+
+    def __init__(self, config: NextLatConfig):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.n_head = config.n_head
+        self.head_dim = config.n_embd // config.n_head
+        h = self.head_dim
+        d = config.n_embd
+        width = max(8, 2 * h)
+        self.uniform_gate = config.head_uniform_gate
+
+        # Share only token compression and gate parameters; the predictors are
+        # independent to allow each head to learn a distinct transition.
+        self.token_projection = nn.Linear(d, h, bias=config.bias)
+        self.state_to_heads = nn.Linear(d, d, bias=config.bias)
+        self.input_norm = LayerNorm(2 * h, bias=config.bias)
+        self.head_predictors = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(2 * h, width, bias=config.bias),
+                    nn.GELU(),
+                    nn.Linear(width, h, bias=config.bias),
+                )
+                for _ in range(self.n_head)
+            ]
+        )
+        self.gate_logits = nn.Linear(2 * h, 1, bias=True)
+
+        # Match the original predictor's parameter count to within roughly
+        # one combiner hidden unit, instead of increasing capacity arbitrarily.
+        baseline_params = NextLatDynamicsModel(config).get_num_params()
+        fixed_params = sum(p.numel() for p in self.parameters())
+        per_combiner_unit = 2 * d + (1 if config.bias else 0)
+        combiner_width = max(
+            1, round((baseline_params - fixed_params - (d if config.bias else 0))
+                     / per_combiner_unit),
+        )
+        self.combiner = nn.Sequential(
+            nn.Linear(d, combiner_width, bias=config.bias),
+            nn.GELU(),
+            nn.Linear(combiner_width, d, bias=config.bias),
+        )
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        current_states: torch.Tensor,
+        next_token_embeds: torch.Tensor,
+        head_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # current_states: (..., d); head_features: (..., n_head, d_head).
+        if head_features is None:
+            head_features = self.state_to_heads(current_states).reshape(
+                *current_states.shape[:-1], self.n_head, self.head_dim
+            )
+        expected = (*current_states.shape[:-1], self.n_head, self.head_dim)
+        if head_features.shape != expected:
+            raise ValueError(f"Expected head_features shape {expected}, got {head_features.shape}")
+
+        token_features = self.token_projection(next_token_embeds)
+        token_features = token_features.unsqueeze(-2).expand_as(head_features)
+        features = self.input_norm(torch.cat([head_features, token_features], dim=-1))
+
+        proposals = torch.stack(
+            [predictor(features[..., i, :])
+             for i, predictor in enumerate(self.head_predictors)],
+            dim=-2,
+        )
+        if self.uniform_gate:
+            weights = torch.full_like(proposals[..., :1], 1.0 / self.n_head)
+        else:
+            weights = F.softmax(self.gate_logits(features), dim=-2)
+        weighted = (proposals * weights).flatten(start_dim=-2)
+        return current_states + self.combiner(weighted)
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
 class NextLatTransformer(DocumentRelativePositions, FusedCrossEntropyLoss, nn.Module):
     def __init__(self, config: NextLatConfig):
         super().__init__()
@@ -119,7 +216,11 @@ class NextLatTransformer(DocumentRelativePositions, FusedCrossEntropyLoss, nn.Mo
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.dynamics_model = NextLatDynamicsModel(config)
+        self.dynamics_model = (
+            HeadSpecificDynamicsModel(config)
+            if config.head_specific_dynamics
+            else NextLatDynamicsModel(config)
+        )
 
         # init all weights
         self.apply(self._init_weights)
@@ -174,7 +275,10 @@ class NextLatTransformer(DocumentRelativePositions, FusedCrossEntropyLoss, nn.Mo
         mask: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
         return_hidden_states: bool = False,
+        return_head_outputs: bool = False,
     ) -> torch.Tensor:
+        if return_head_outputs and not return_hidden_states:
+            raise ValueError("return_head_outputs requires return_hidden_states=True")
         batch_size, seq_len = batch.size()
         assert (
             seq_len <= self.config.block_size
@@ -192,11 +296,18 @@ class NextLatTransformer(DocumentRelativePositions, FusedCrossEntropyLoss, nn.Mo
         x = self.token_embedding(batch)
         token_embeds = x
 
-        for block in self.transformer.blocks:
-            x = block(x, mask=mask, rope=rope)
+        for i, block in enumerate(self.transformer.blocks):
+            if return_head_outputs and i == len(self.transformer.blocks) - 1:
+                x, head_outputs = block(
+                    x, mask=mask, rope=rope, return_head_outputs=True
+                )
+            else:
+                x = block(x, mask=mask, rope=rope)
         text_embd = self.transformer.norm(x)
 
         if return_hidden_states:
+            if return_head_outputs:
+                return token_embeds, text_embd, head_outputs
             return token_embeds, text_embd
 
         # If no targets given, return logits
@@ -336,6 +447,7 @@ class NextLat(ModelBase, SpeculativeModel):
         targets: torch.Tensor,
         nextlat_token_pred_mask: torch.Tensor,
         curr_token_is_eos: torch.Tensor,
+        head_outputs_det: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         We separate _nextlat_compute_losses into a separate function so that
@@ -386,7 +498,19 @@ class NextLat(ModelBase, SpeculativeModel):
             # We now predict the next-hidden state using current hidden states and next token embeddings.
             # P(\hat{h}_{t+1} | h_t, x_{t+1})
             # h_1, h_2, ..., h_{T-1} -> h_2, h_3, ..., h_T
-            pred_next_states = self.model.dynamics_model(pred_next_states, next_tokens)
+            if self.config.head_specific_dynamics:
+                # Actual final-layer head outputs anchor the first step; later
+                # steps use state_to_heads(pred_next_states) for cheap rollout.
+                current_heads = (
+                    head_outputs_det[:, :-1] if i == 0 else None
+                )
+                pred_next_states = self.model.dynamics_model(
+                    pred_next_states, next_tokens, head_features=current_heads
+                )
+            else:
+                pred_next_states = self.model.dynamics_model(
+                    pred_next_states, next_tokens
+                )
 
             # skip MSE on h_{t+1} corresponding to EOS token because it crosses document boundaries
             # EOS token is first hidden state in the next document, see create_attention_mask()
@@ -457,9 +581,17 @@ class NextLat(ModelBase, SpeculativeModel):
         # This allows us to re-shard each layer of the model after backward pass
         is_fsdp = isinstance(self.model.module, FSDPModule)
         with self.fabric.no_backward_sync(self.model, no_sync and not is_fsdp):
-            next_token_embeds, hidden_states = self.model(
-                inputs, return_hidden_states=True
+            transformer_outputs = self.model(
+                inputs,
+                return_hidden_states=True,
+                return_head_outputs=self.config.head_specific_dynamics,
             )
+            if self.config.head_specific_dynamics:
+                next_token_embeds, hidden_states, head_outputs = transformer_outputs
+                head_outputs_det = head_outputs.detach().requires_grad_()
+            else:
+                next_token_embeds, hidden_states = transformer_outputs
+                head_outputs_det = None
 
             # Detach hidden states and next token embeddings to accumulate gradients from the losses involving
             # next-hidden states and next-token predictions.
@@ -478,6 +610,7 @@ class NextLat(ModelBase, SpeculativeModel):
                         targets,
                         nextlat_token_pred_mask,
                         curr_token_is_eos,
+                        head_outputs_det=head_outputs_det,
                     )
                 )
 
@@ -505,7 +638,7 @@ class NextLat(ModelBase, SpeculativeModel):
             # then we backpropagate the accumulated gradients through the transformer trunk all at once.
             if backpropagate:
                 self.fabric.backward(loss)
-                combined_emb = torch.cat([hidden_states, next_token_embeds], dim=0)
+                embeddings = [hidden_states, next_token_embeds]
                 # Get the gradients of the hidden states and next token embeddings.
                 hidden_states_grad = (
                     hidden_states_det.grad
@@ -517,12 +650,22 @@ class NextLat(ModelBase, SpeculativeModel):
                     if next_token_embeds_det.grad is not None
                     else torch.zeros_like(next_token_embeds_det)
                 )
-                # Combine the gradients of the hidden states and next token embeddings.
-                combined_grad = torch.cat(
-                    [hidden_states_grad, next_token_embeds_grad], dim=0
+                gradients = [hidden_states_grad, next_token_embeds_grad]
+                if head_outputs_det is not None:
+                    # The head-specific loss also has a direct gradient path
+                    # into the last attention layer, beyond the final latent.
+                    embeddings.append(head_outputs.flatten(start_dim=-2))
+                    head_grad = (
+                        head_outputs_det.grad
+                        if head_outputs_det.grad is not None
+                        else torch.zeros_like(head_outputs_det)
+                    )
+                    gradients.append(head_grad.flatten(start_dim=-2))
+                # Backpropagate all detached-output gradients together, once.
+                self.fabric.backward(
+                    torch.cat(embeddings, dim=0),
+                    gradient=torch.cat(gradients, dim=0),
                 )
-                # Backpropagate the gradients through the transformer trunk.
-                self.fabric.backward(combined_emb, gradient=combined_grad)
 
         result = {
             "loss": loss.detach(),
@@ -684,7 +827,17 @@ class NextLat(ModelBase, SpeculativeModel):
         top_p: Optional[float],
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         core = self._unwrap_module()
-        _, hidden_states = core(seq, return_hidden_states=True)
+        transformer_outputs = core(
+            seq,
+            return_hidden_states=True,
+            return_head_outputs=self.config.head_specific_dynamics,
+        )
+        if self.config.head_specific_dynamics:
+            _, hidden_states, head_outputs = transformer_outputs
+            current_heads = head_outputs[:, -1, :, :]
+        else:
+            _, hidden_states = transformer_outputs
+            current_heads = None
         state = hidden_states[:, -1, :]
         drafted: List[torch.Tensor] = []
         q_probs_steps: List[torch.Tensor] = []
@@ -698,7 +851,14 @@ class NextLat(ModelBase, SpeculativeModel):
             drafted.append(tok)
             q_probs_steps.append(q_probs)
             next_token_emb = core.token_embedding(tok).squeeze(1)
-            state = core.dynamics_model(state, next_token_emb)
+            if self.config.head_specific_dynamics:
+                state = core.dynamics_model(
+                    state, next_token_emb, head_features=current_heads
+                )
+                # Subsequent speculative steps rely on projected head features.
+                current_heads = None
+            else:
+                state = core.dynamics_model(state, next_token_emb)
 
         return torch.cat(drafted, dim=1), q_probs_steps
 
