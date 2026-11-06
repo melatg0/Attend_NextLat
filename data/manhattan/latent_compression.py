@@ -154,6 +154,8 @@ if __name__ == "__main__":
         checkpoint_path=checkpoint_path,
     )
 
+    model.eval()
+
     valid_turns = tokenizer.valid_turns
     node_and_direction_to_neighbor = tokenizer.node_and_direction_to_neighbor
     eos_token_id = tokenizer.word_to_id["end"]
@@ -212,7 +214,7 @@ if __name__ == "__main__":
         inputs = batch.to(device)
         with torch.no_grad():
             if isinstance(model, NextLat):
-                hidden_states, _ = model.model(inputs, return_hidden_states=True)
+                _, hidden_states = model.model(inputs, return_hidden_states=True)
             elif isinstance(model, BST):
                 hidden_states, _ = model.encoder(
                     inputs, compute_forward=True, compute_backward=False

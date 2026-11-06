@@ -116,6 +116,10 @@ model:
   lambda_ce: 0.0
   mtp_horizon: 1
   proj_factor: 1.0
+  # Attend-NextLat: use per-head latent updates and a token-conditioned gate
+  head_specific_dynamics: false
+  # Ablation: uniform head weights rather than a learned gate
+  head_uniform_gate: false
 
 optimizer:
   optimizer_type: adam # options: adam, muon
