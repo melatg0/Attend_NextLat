@@ -152,6 +152,11 @@ class StarGraphDataset(torch.utils.data.Dataset):
                 global_token_correct / global_total_tokens
             ).item()
 
+        # Paths include the source node; token_2 is the first arm choice.
+        if self.graph_target_len > 1:
+            test_logs[f"{prefix_label}first_step_accuracy"] = per_token_accuracy[
+                f"{prefix_label}token_2"
+            ]
         test_logs[f"{prefix_label}test_accuracy"] = overall_accuracy
         test_logs.update(per_token_accuracy)
 

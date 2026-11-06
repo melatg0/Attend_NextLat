@@ -52,7 +52,7 @@ class NextLatDynamicsModel(nn.Module):
         self.config = config
         input_dim = config.n_embd * 2  # hidden states and next token embeddings
         hidden_dim = config.proj_factor * input_dim
-        hidden_dim = 128 * round(hidden_dim / 128)
+        hidden_dim = max(128, 128 * round(hidden_dim / 128))
 
         # MLP to combine forward and backward embeddings
         # Input to MLP (output from transformer encoders) is already normalized
@@ -431,8 +431,8 @@ class NextLat(ModelBase, SpeculativeModel):
             pred_tokens.reshape(-1, pred_tokens.size(-1)),
             targets_masked.reshape(-1),
             ignore_index=-100,
-            reduction="mean",
-        )
+            reduction="sum",
+        ) / (targets_masked != -100).sum().clamp_min(1)
         # Detach teacher logits to avoid updating teacher computation graph
         kl_loss = self._categorical_kl_loss(
             teacher_logits.detach(), pred_tokens, token_pred_mask
@@ -457,6 +457,9 @@ class NextLat(ModelBase, SpeculativeModel):
         next_states = hidden_states_det  # Shape: (batch_size, seq_len, n_embd)
         pred_next_states = hidden_states_det
         next_tokens = next_token_embeds_det
+        # EOS starts a new attention segment. Compare endpoints so every
+        # boundary crossed by a recursive rollout invalidates its loss.
+        document_ids = curr_token_is_eos.long().cumsum(dim=1)
 
         # ------------------------------------------------------------
         # Standard next-token prediction loss
@@ -515,7 +518,9 @@ class NextLat(ModelBase, SpeculativeModel):
             # skip MSE on h_{t+1} corresponding to EOS token because it crosses document boundaries
             # EOS token is first hidden state in the next document, see create_attention_mask()
             # also, predicting the hidden state of the EOS token is not needed for belief state convergence
-            mse_mask = ~curr_token_is_eos[:, i + 1 :]
+            horizon = i + 1
+            mse_mask = document_ids[:, :-horizon] == document_ids[:, horizon:]
+            token_pred_mask = nextlat_token_pred_mask & mse_mask[:, :-1]
 
             # Compute NextLat loss
             mse_loss, nextlat_token_loss, kl_loss = self._nextlat_loss_function(
@@ -523,7 +528,7 @@ class NextLat(ModelBase, SpeculativeModel):
                 next_states,
                 targets,
                 teacher_logits,
-                token_pred_mask=nextlat_token_pred_mask,
+                token_pred_mask=token_pred_mask,
                 mse_mask=mse_mask,
             )
 
@@ -551,6 +556,8 @@ class NextLat(ModelBase, SpeculativeModel):
 
         # Predict next token for all tokens before the last token
         batch_size, seq_len = batch.shape
+        if not 1 <= self.config.mtp_horizon <= seq_len - 2:
+            raise ValueError("mtp_horizon must be between 1 and sequence length minus 2")
         inputs = batch
         targets = batch[:, 1:]
 

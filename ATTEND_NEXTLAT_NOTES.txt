@@ -36,3 +36,29 @@ Limitations and checks:
 - This commit changes architecture and configuration only; it does not prove
   better accuracy, equal FLOPs, or runtime feasibility. Run smoke tests, then
   compare baseline/learned/uniform gating with the same seeds and horizons.
+
+Correctness fixes and tests
+---------------------------
+- Recursive latent and token losses reject every crossed document boundary,
+  including boundaries crossed before the destination token. EOS-started
+  predictions within the new document remain valid.
+- Auxiliary CE is zero for fully ignored targets; invalid sequence/horizon
+  combinations fail early. Small baseline MLP widths cannot round to zero.
+- Manhattan rank evaluation uses contextual states, not token embeddings.
+- Path-Star logs first_step_accuracy from token_2 (token_1 copies the source).
+- Explicit attend_learned_* and attend_uniform_* configs enable the extension
+  for Manhattan and each Path-Star benchmark. They disable compilation for
+  initial validation; Path-Star configs use greedy generation. Use the same
+  decoding and compilation settings for baseline comparisons.
+
+Run all unit/regression tests from the repository root:
+    python -m unittest discover -s tests -v
+
+The suite covers both dynamics modes, uniform gating, parameter budgets,
+boundary masks, empty auxiliary losses, source-versus-arm accuracy, unchanged
+logits when heads are returned, and full Fabric CPU training gradients versus
+a direct-autograd reference (including multi-step loss scaling).
+These tests do not establish GPU/DDP/FSDP or compiled correctness, benchmark
+quality, head specialization, or training feasibility. Matched-information
+controls and variance-normalized latent evaluation remain separate research
+work; no architecture claim is implied by these correctness fixes.
