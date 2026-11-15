@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -162,8 +163,10 @@ class HeadSpecificDynamicsModel(nn.Module):
         current_states: torch.Tensor,
         next_token_embeds: torch.Tensor,
         head_features: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_gate_weights: bool = False,
+    ):
         # current_states: (..., d); head_features: (..., n_head, d_head).
+        # If return_gate_weights, also returns weights of shape (..., n_head, 1).
         if head_features is None:
             head_features = self.state_to_heads(current_states).reshape(
                 *current_states.shape[:-1], self.n_head, self.head_dim
@@ -186,7 +189,10 @@ class HeadSpecificDynamicsModel(nn.Module):
         else:
             weights = F.softmax(self.gate_logits(features), dim=-2)
         weighted = (proposals * weights).flatten(start_dim=-2)
-        return current_states + self.combiner(weighted)
+        next_states = current_states + self.combiner(weighted)
+        if return_gate_weights:
+            return next_states, weights
+        return next_states
 
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -478,6 +484,7 @@ class NextLat(ModelBase, SpeculativeModel):
             self.config.mtp_horizon, device=hidden_states_det.device
         )
         total_kl_loss = torch.zeros(1, device=hidden_states_det.device)
+        metrics: Dict[str, torch.Tensor] = {}
         # We can do multi-step prediction in a recursive manner.
         # P(\hat{h}_{t+1} | h_t, x_{t+1})
         # P(\hat{h}_{t+2} | \hat{h}_{t+1}, x_{t+2})
@@ -498,14 +505,18 @@ class NextLat(ModelBase, SpeculativeModel):
             # We now predict the next-hidden state using current hidden states and next token embeddings.
             # P(\hat{h}_{t+1} | h_t, x_{t+1})
             # h_1, h_2, ..., h_{T-1} -> h_2, h_3, ..., h_T
+            gate_weights = None
             if self.config.head_specific_dynamics:
                 # Actual final-layer head outputs anchor the first step; later
                 # steps use state_to_heads(pred_next_states) for cheap rollout.
                 current_heads = (
                     head_outputs_det[:, :-1] if i == 0 else None
                 )
-                pred_next_states = self.model.dynamics_model(
-                    pred_next_states, next_tokens, head_features=current_heads
+                pred_next_states, gate_weights = self.model.dynamics_model(
+                    pred_next_states,
+                    next_tokens,
+                    head_features=current_heads,
+                    return_gate_weights=True,
                 )
             else:
                 pred_next_states = self.model.dynamics_model(
@@ -531,7 +542,71 @@ class NextLat(ModelBase, SpeculativeModel):
             total_kl_loss += kl_loss
             total_nextlat_token_loss[i] = nextlat_token_loss
 
-        return ntp_loss, total_mse_loss, total_kl_loss, total_nextlat_token_loss
+            # Logging-only diagnostics (no gradients)
+            metrics.update(
+                self._latent_step_metrics(
+                    i + 1, mse_loss, next_states, mse_mask, gate_weights
+                )
+            )
+
+        horizon = self.config.mtp_horizon
+        metrics["nsl1"] = (
+            sum(metrics[f"nsl1_step_{k + 1}"] for k in range(horizon)) / horizon
+        )
+        if self.config.head_specific_dynamics and not self.config.head_uniform_gate:
+            metrics["gate/entropy"] = (
+                sum(metrics[f"gate/entropy_step_{k + 1}"] for k in range(horizon))
+                / horizon
+            )
+
+        return (
+            ntp_loss,
+            total_mse_loss,
+            total_kl_loss,
+            total_nextlat_token_loss,
+            metrics,
+        )
+
+    @torch.no_grad()
+    def _latent_step_metrics(
+        self,
+        step: int,
+        mse_loss: torch.Tensor,
+        next_states: torch.Tensor,
+        mse_mask: torch.Tensor,
+        gate_weights: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Diagnostics for rollout step `step` (1-indexed):
+          - mse_step_k:  masked smooth L1 between predicted and actual latent (= the training term)
+          - nsl1_step_k: smooth L1 normalized by the mean per-dimension variance of the true latents
+          - gate/*:      learned-gate statistics (entropy normalized to [0, 1]; per-head mean weight at step 1)
+        """
+        out = {}
+        mse_loss = mse_loss.detach().float().reshape(())
+        out[f"mse_step_{step}"] = mse_loss
+
+        w = mse_mask.unsqueeze(-1).to(torch.float32)  # (B, T, 1)
+        h = next_states.detach().float()  # (B, T, d)
+        n_valid = w.sum().clamp_min(1.0)
+        mean = (h * w).sum(dim=(0, 1)) / n_valid  # (d,)
+        var = (((h - mean) ** 2) * w).sum(dim=(0, 1)) / n_valid  # (d,)
+        out[f"nsl1_step_{step}"] = mse_loss / var.mean().clamp_min(1e-8)
+
+        if gate_weights is not None and not self.config.head_uniform_gate:
+            g = gate_weights.detach().float().squeeze(-1)  # (B, T, n_head)
+            m = mse_mask.to(torch.float32)  # (B, T)
+            n_tok = m.sum().clamp_min(1.0)
+            entropy = -(g * torch.log(g.clamp_min(1e-12))).sum(dim=-1)
+            entropy = entropy / math.log(g.size(-1))
+            out[f"gate/entropy_step_{step}"] = (entropy * m).sum() / n_tok
+            if step == 1:
+                # Step 1 uses the transformer's real head outputs
+                mean_w = (g * m.unsqueeze(-1)).sum(dim=(0, 1)) / n_tok
+                for k in range(g.size(-1)):
+                    out[f"gate/w_head{k}"] = mean_w[k]
+                out["gate/max_w"] = (g.max(dim=-1).values * m).sum() / n_tok
+        return out
 
     def compute_loss(
         self,
@@ -603,8 +678,13 @@ class NextLat(ModelBase, SpeculativeModel):
             # Loss runs outside the wrapped module forward; use Fabric autocast so NextLat/CE/KL/etc.
             # follow the same mixed-precision (if enabled) policy as the rest of training.
             with self.fabric.autocast():
-                ntp_loss, total_mse_loss, total_kl_loss, total_nextlat_token_loss = (
-                    self._nextlat_compute_losses(
+                (
+                    ntp_loss,
+                    total_mse_loss,
+                    total_kl_loss,
+                    total_nextlat_token_loss,
+                    latent_metrics,
+                ) = self._nextlat_compute_losses(
                         hidden_states_det,
                         next_token_embeds_det,
                         targets,
@@ -612,7 +692,6 @@ class NextLat(ModelBase, SpeculativeModel):
                         curr_token_is_eos,
                         head_outputs_det=head_outputs_det,
                     )
-                )
 
                 # We average the losses over the multi-step prediction interval.
                 total_mse_loss = total_mse_loss / self.config.mtp_horizon
@@ -678,6 +757,10 @@ class NextLat(ModelBase, SpeculativeModel):
                 f"loss_token_{i+1}": nextlat_token_loss[i].detach()
                 for i in range(self.config.mtp_horizon)
             }
+        )
+        # Diagnostics are divided by loss_div so gradient-accumulation sums give the batch mean
+        result.update(
+            {k: v.detach().reshape(1) / loss_div for k, v in latent_metrics.items()}
         )
 
         # We measure the rank of the hidden states to check if the hidden states are collapsing.
