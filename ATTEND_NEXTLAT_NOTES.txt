@@ -49,7 +49,7 @@ secret; in SSH sessions run `source /etc/rp_environment` first):
   SKIP_GIT=1 bash scripts/runpod/setup.sh 7_7      # deps, data, unit tests (SKIP_GIT if code was rsynced)
   bash scripts/runpod/smoke.sh 7_7                 # short check of all variants + resume + eval
   tmux new -s runs
-  bash scripts/runpod/launch_stargraph.sh 7_7 1    # 3 variants x seeds 1234-1236, 1 job per GPU
+  bash scripts/runpod/launch_runs.sh 7_7 1         # 3 variants x seeds 1234-1236, 1 job per GPU
   python scripts/runpod/finish_and_notify.py --root output/attend/7_7 --name results-7_7
 Re-running the launcher skips finished runs (DONE marker) and resumes the rest. One job already
 keeps an H100 ~75-80% busy; running several jobs per GPU does not raise total throughput.
@@ -88,3 +88,36 @@ Results so far: G(7,7), seed 1234, compiled (full 19,968-graph test set)
 Learned gate: ~2x faster to 90%, ~43% lower latent error, slightly lower final solve rate; gate
 entropy 0.69 (moved away from uniform). One seed only: confirm with seeds 1235/1236.
 W&B: project attend-nextlat-stargraph, artifact results-7_7-seed1234.
+
+Running the Manhattan experiments (RunPod)
+==========================================
+Configs: config/manhattan/attend/{nextlat,learned}_manhattan.yaml. Paper settings (48 layers, 8 heads,
+width 384, batch 256, block 256, lr 1e-4, wd 0.01, no grad clip) with the original config's tuned
+sweep values written in (mtp_horizon 8, lambda_mse 1.0, lambda_kl 0.1, proj_factor 2.0), compile on,
+validation loss on a fixed 50-batch heldout sample (the full 908k-trip split takes minutes), and a
+400k-step schedule (override trainer.train_batches for a shorter run). Predictor parameters:
+4,129,536 (baseline) vs 4,129,729 (head-specific).
+
+Per-head sizing rule (model.head_param_share): the per-head MLPs hold a fixed share of the baseline
+predictor's parameter budget and the combiner MLP takes the rest, so the total always matches the
+baseline. Share 0.25 is used because the original fixed width (2 * head_dim) gives exactly 25% on the
+Path-Star configs (per-head width 128; those runs are bitwise identical under either rule). With the
+fixed width, Manhattan's 7x larger budget would leave the heads 2.7% and the combiner 93%; with share
+0.25 the heads get 25% (per-head width 896), the state-to-heads projection 3.6%, the combiner 71%.
+
+Pod: GPUs + a network volume at /workspace (runs take days; HF dataset ~20 GB is cached there).
+  SKIP_GIT=1 bash scripts/runpod/setup.sh manhattan    # deps (+osmnx), artifacts, dataset, heldout text
+  bash scripts/manhattan/smoke_manhattan.sh            # 400-step train/resume + all evals, speed/memory
+  bash scripts/runpod/launch_runs.sh manhattan 1       # nextlat + learned, seed 1234, one GPU each
+  python scripts/manhattan/finish_manhattan.py         # evals on final checkpoints, table, W&B, alert
+scripts/manhattan/prepare_data.py rebuilds data/manhattan/random_walks/heldout_sequences.txt (needed by
+latent_compression.py, otherwise only available via the Google Drive download) by decoding the
+pretokenized heldout split; re-encoding is checked against the original token ids.
+
+Evaluations (scripts/manhattan/eval_manhattan.sh <ckpt>, paper Table 1; results in metrics.json):
+  trajectories_valid / _reached_end  6,400 generated trips between heldout pairs (shortest path <= 50)
+  map_true_edges / map_new_edges     street map rebuilt from those trips (downloads the OSM graph)
+  compression_precision              sequence compression test
+  detour_valid / _reached_end        random valid detours with p=0.75 (valid = every turn legal)
+  effective_rank, participation_ratio  hidden-state compactness
+During training: generalization/test_accuracy and valid_accuracy, val/valid_accuracy, val/nsl1_step_k.
