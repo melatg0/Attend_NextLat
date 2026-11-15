@@ -23,6 +23,10 @@ NAME=${2:-$(basename "$EXP_DIR")-$STEM$SUFFIX}
 OUT="$EXP_DIR/manhattan_eval_$STEM$SUFFIX"
 DATA=data/manhattan/random_walks
 mkdir -p "$OUT"
+# The eval scripts create a default lightning Fabric(), which uses every visible GPU and then
+# asserts world_size == 1: pin them to one GPU (the first of CUDA_VISIBLE_DEVICES, default 0).
+CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES%%,*}
 
 if [ "${QUICK:-0}" = "1" ]; then
     GEN=(--num_samples 2 --batch_size 32); NSEQ=64
@@ -39,7 +43,9 @@ run() {  # run <step> <command...>: log to $OUT/<step>.log, never abort the rema
     echo "[$(date '+%F %T')] $step"
     if ! "$@" > "$OUT/$step.log" 2>&1; then echo "    FAILED (see $OUT/$step.log)"; fi
 }
-run 1_trajectories fabric run --devices 1 data/manhattan/generate_manhattan_trajectories.py \
+# fabric run's default port (29400) clashes with concurrent training or a second eval: use a free one
+PORT=$(python -c "import socket; s = socket.socket(); s.bind(('', 0)); print(s.getsockname()[1])")
+run 1_trajectories fabric run --devices 1 --main-port "$PORT" data/manhattan/generate_manhattan_trajectories.py \
     "${GEN[@]}" "${COMMON[@]}" "${OVERRIDES[@]}"
 run 2_map_reconstruction bash -c "cd data/manhattan && python make_graphs.py --dataset random_walks \
     --model_name '$NAME' --nsequences $NSEQ --degree 8"
