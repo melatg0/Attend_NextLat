@@ -95,6 +95,7 @@ def initialize_model(
             "proj_factor": config.model.proj_factor,
             "head_specific_dynamics": config.model.head_specific_dynamics,
             "head_uniform_gate": config.model.head_uniform_gate,
+            "head_param_share": config.model.get("head_param_share", None),
             "compute_hidden_state_rank": config.model.compute_hidden_state_rank,
         }
     elif config.use_mtp_gloeckle:

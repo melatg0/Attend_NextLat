@@ -55,6 +55,36 @@ class HeadSpecificDynamicsTests(unittest.TestCase):
         )
         self.assertEqual(prediction.shape, (2, 32))
 
+    def test_head_param_share_sizing(self):
+        def build(share, n_head, proj_factor, seed=0):
+            torch.manual_seed(seed)
+            cfg = NextLatConfig(vocab_size=128, block_size=16, n_layer=1, n_head=n_head,
+                                n_embd=384, proj_factor=proj_factor, head_specific_dynamics=True,
+                                head_param_share=share)
+            model = HeadSpecificDynamicsModel(cfg)
+            baseline = NextLatDynamicsModel(cfg).get_num_params()
+            return model, baseline
+
+        # Path-Star sizes (6 heads, proj_factor 0.5): share 0.25 reproduces the default exactly
+        default, baseline = build(None, 6, 0.5)
+        shared, _ = build(0.25, 6, 0.5)
+        self.assertEqual(default.head_width, 128)
+        self.assertEqual(shared.head_width, 128)
+        for (k, a), (_, b) in zip(default.state_dict().items(), shared.state_dict().items()):
+            self.assertTrue(torch.equal(a, b), k)
+
+        # Manhattan sizes (8 heads, proj_factor 2.0): per-head MLPs grow, combiner shrinks
+        default, baseline = build(None, 8, 2.0)
+        shared, _ = build(0.25, 8, 2.0)
+        self.assertEqual(default.head_width, 96)
+        self.assertEqual(shared.head_width, 896)
+        head_params = sum(p.numel() for p in shared.head_predictors.parameters())
+        self.assertAlmostEqual(head_params / baseline, 0.25, places=2)
+
+        # Total predictor size still matches the baseline to within one combiner unit (2 * n_embd)
+        for model in (default, shared):
+            self.assertLessEqual(abs(model.get_num_params() - baseline), 2 * 384)
+
     def _latent_metrics(self, head_specific, uniform_gate=False, horizon=3):
         torch.manual_seed(0)
         cfg = NextLatConfig(

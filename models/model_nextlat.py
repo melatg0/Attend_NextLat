@@ -45,6 +45,11 @@ class NextLatConfig:
     proj_factor: float = 1.0  # projection factor in the latent dynamics model MLP
     head_specific_dynamics: bool = False  # opt-in Attend-NextLat predictor
     head_uniform_gate: bool = False  # ablation: replace learned weights with 1/n_head
+    # Per-head MLP sizing. None: fixed hidden width 2 * head_dim (combiner takes the rest of the
+    # budget). A float s: size the per-head MLPs to hold fraction s of the baseline predictor's
+    # parameters, keeping the heads' share constant as the budget grows. s=0.25 reproduces the
+    # default widths on the Path-Star configs (width 128) and gives width 896 on Manhattan.
+    head_param_share: Optional[float] = None
 
 
 class NextLatDynamicsModel(nn.Module):
@@ -116,7 +121,8 @@ class HeadSpecificDynamicsModel(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         h = self.head_dim
         d = config.n_embd
-        width = max(8, 2 * h)
+        self.head_width = self.per_head_width(config)
+        width = self.head_width
         self.uniform_gate = config.head_uniform_gate
 
         # Share only token compression and gate parameters; the predictors are
@@ -151,6 +157,22 @@ class HeadSpecificDynamicsModel(nn.Module):
             nn.Linear(combiner_width, d, bias=config.bias),
         )
         self.apply(self._init_weights)
+
+    @staticmethod
+    def per_head_width(config: NextLatConfig) -> int:
+        """Hidden width of each per-head MLP (see NextLatConfig.head_param_share)."""
+        h = config.n_embd // config.n_head
+        share = config.head_param_share
+        if share is None:
+            return max(8, 2 * h)
+        assert 0.0 < share < 1.0, f"head_param_share must be in (0, 1), got {share}"
+        # Count the baseline predictor on the meta device: no memory and no RNG use.
+        with torch.device("meta"):
+            baseline_params = NextLatDynamicsModel(config).get_num_params()
+        b = 1 if config.bias else 0
+        # Each per-head MLP: Linear(2h -> w) + Linear(w -> h) = 3h*w weights (+ w + h biases)
+        per_head_target = share * baseline_params / config.n_head
+        return max(8, round((per_head_target - b * h) / (3 * h + b)))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):

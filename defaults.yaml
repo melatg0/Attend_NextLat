@@ -120,6 +120,8 @@ model:
   head_specific_dynamics: false
   # Ablation: uniform head weights rather than a learned gate
   head_uniform_gate: false
+  # Per-head MLP sizing: null = fixed width 2*head_dim; float = share of the predictor budget
+  head_param_share: null
 
 optimizer:
   optimizer_type: adam # options: adam, muon
