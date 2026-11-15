@@ -106,6 +106,7 @@ if __name__ == "__main__":
     bar = tqdm(range(args.num_trials))
     total_nodes = 0
     success_nodes = 0
+    reached_nodes = 0
     for index in bar:
         pairs = all_pairs[np.random.choice(len(all_pairs), size=1)]
         input_ids = torch.tensor(
@@ -235,8 +236,17 @@ if __name__ == "__main__":
         total_nodes += 1
         if is_valid:
             success_nodes += 1
+        if reached_end:
+            reached_nodes += 1
         success_rate = success_nodes / total_nodes
         std = np.sqrt(success_rate * (1 - success_rate) / total_nodes)
         bar.set_description(
             f"Fraction successful {args.data_dir} ({args.detour_type} detours, p={args.detour_prob}): {success_rate:.3f} ({std:.3f})"
         )
+
+    # Final summary on one parseable line (the progress bar is not logged reliably).
+    # "valid" (every turn legal) is the detour-robustness metric used by the original code.
+    print(
+        f"FINAL detour: type={args.detour_type} p={args.detour_prob} n={total_nodes} "
+        f"valid={success_rate:.4f} valid_std={std:.4f} reached_end={reached_nodes/total_nodes:.4f}"
+    )

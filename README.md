@@ -161,7 +161,7 @@ Please modify the `--config` (path to the `materialized_config.yaml` produced in
 This script uses the trained model checkpoint to generate trajectories in Manhattan, which are then used to evaluate the model's internal world model. The corresponding code can be found in `data/manhattan/`:
 - `generate_manhattan_trajectories.py`: Generate trajectories in Manhattan using the trained model and save them in the `data/manhattan/samples/` folder as `.txt` files. 
 - `make_graphs.py`: Produce the reconstructed graph of Manhattan roads based on the generated trajectories and save them in the `data/manhattan/graphs/` folder as `.pkl` files.
-- `compression_test.py`: Evaluate the sequence compression metric.
+- `sequence_compression.py`: Evaluate the sequence compression metric.
 - `detour_test.py`: Evaluate the detour robustness metric.
 - `latent_compression.py`: Evaluate the effective latent rank metric.
 

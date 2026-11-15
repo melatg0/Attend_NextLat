@@ -136,6 +136,12 @@ if __name__ == "__main__":
             f"Fraction successful: {num_successful/total_nodes:.2f} ({num_successful}/{total_nodes}), Fraction valid: {num_valid/total_nodes:.2f} ({num_valid}/{total_nodes})"
         )
 
+    # Final summary on one parseable line (the progress bar is not logged reliably)
+    print(
+        f"FINAL generation: n={total_nodes} reached_end={num_successful/total_nodes:.4f} "
+        f"valid={num_valid/total_nodes:.4f}"
+    )
+
     # Save samples
     os.makedirs(f"{args.data_dir}/samples", exist_ok=True)
     with open(f"{args.data_dir}/samples/{args.model_name}.txt", "w") as f:
