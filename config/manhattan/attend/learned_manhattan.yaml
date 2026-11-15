@@ -35,7 +35,9 @@ trainer:
 data:
   dataset: manhattan
   effective_batch_size: 256
-  gradient_accum_steps: 1
+  # 2 micro-batches of 128 = the paper's batch of 256 per update (same math): the learned gate
+  # ran out of 80 GB at micro-batch 256, and the baseline peaked at 71 GB
+  gradient_accum_steps: 2
   pair_accum_steps: 1
   num_workers: 1
   test_generalization: true
