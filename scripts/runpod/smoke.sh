@@ -55,4 +55,4 @@ done
 
 echo
 echo "==> Smoke test passed. Check W&B project '$WANDB_SMOKE_PROJECT' for nsl1_step_*, gate/*, params/*, val_(*)/test_accuracy."
-echo "    If GPU utilization (nvidia-smi) is low, raise JOBS_PER_GPU for launch_stargraph.sh."
+echo "    If GPU utilization (nvidia-smi) is low, raise JOBS_PER_GPU for launch_runs.sh."

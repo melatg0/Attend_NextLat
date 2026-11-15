@@ -1,22 +1,38 @@
 #!/bin/bash
-# Launch the Attend-NextLat Path-Star comparison: 3 variants x N seeds, one single-GPU job each.
+# Launch an Attend-NextLat comparison: variants x seeds, one single-GPU job each.
 #
 # Usage (from repo root, inside tmux):
-#   bash scripts/runpod/launch_stargraph.sh <graph> [JOBS_PER_GPU]
-#   e.g. bash scripts/runpod/launch_stargraph.sh 7_7 1   (one job per GPU is fastest on an H100)
+#   bash scripts/runpod/launch_runs.sh <task> [JOBS_PER_GPU]
+#   <task> is a Path-Star graph (5_5, 7_7, ...) or manhattan
+#   e.g. bash scripts/runpod/launch_runs.sh 7_7 1   (one job per GPU is fastest on an H100)
 #
 # Env overrides: SEEDS="1234 1235 1236"  VARIANTS="nextlat learned uniform"  NUM_GPUS=<n>
 #                OUT_ROOT=output/attend   EXTRA_ARGS="trainer.foo=bar ..."
+# Defaults: Path-Star runs all 3 variants x 3 seeds; manhattan runs nextlat + learned, seed 1234.
 #
-# Each job writes to $OUT_ROOT/<graph>/<variant>/seed<S>/ (own checkpoint pointers, so
+# Each job writes to $OUT_ROOT/<task>/<variant>/seed<S>/ (own checkpoint pointers, so
 # jobs never clobber each other). Re-running this script skips finished jobs (DONE marker)
 # and resumes unfinished ones from their latest checkpoint.
 set -uo pipefail
 
-GRAPH=${1:?usage: launch_stargraph.sh <graph> [JOBS_PER_GPU]}
+GRAPH=${1:?usage: launch_runs.sh <task> [JOBS_PER_GPU]}
 JOBS_PER_GPU=${2:-1}
-SEEDS=(${SEEDS:-1234 1235 1236})
-VARIANTS=(${VARIANTS:-nextlat learned uniform})
+if [ "$GRAPH" = "manhattan" ]; then
+    SEEDS=(${SEEDS:-1234})
+    VARIANTS=(${VARIANTS:-nextlat learned})
+    # Same cache location as setup.sh, so training reads the pre-downloaded dataset
+    export HF_HOME=${HF_HOME:-/workspace/hf_cache}
+else
+    SEEDS=(${SEEDS:-1234 1235 1236})
+    VARIANTS=(${VARIANTS:-nextlat learned uniform})
+fi
+config_for() {
+    if [ "$GRAPH" = "manhattan" ]; then
+        echo "config/manhattan/attend/${1}_manhattan.yaml"
+    else
+        echo "config/stargraph/$GRAPH/attend/${1}_stargraph_${GRAPH}.yaml"
+    fi
+}
 OUT_ROOT=${OUT_ROOT:-output/attend}
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
 [ "$NUM_GPUS" -ge 1 ] || { echo "No GPUs found (set NUM_GPUS to override)"; exit 1; }
@@ -24,12 +40,12 @@ NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
 # Build the job list (seed-major: one run of every variant per seed comes first), skipping finished runs
 jobs=()
 for variant in "${VARIANTS[@]}"; do
-    cfg="config/stargraph/$GRAPH/attend/${variant}_stargraph_${GRAPH}.yaml"
+    cfg=$(config_for "$variant")
     [ -f "$cfg" ] || { echo "Missing config $cfg"; exit 1; }
 done
 for seed in "${SEEDS[@]}"; do
     for variant in "${VARIANTS[@]}"; do
-        cfg="config/stargraph/$GRAPH/attend/${variant}_stargraph_${GRAPH}.yaml"
+        cfg=$(config_for "$variant")
         run_dir="$OUT_ROOT/$GRAPH/$variant/seed$seed"
         if [ -f "$run_dir/DONE" ]; then
             echo "skip (done): $run_dir"
@@ -70,4 +86,4 @@ for ((s = 0; s < n_slots; s++)); do
 done
 wait
 echo "All slots finished. Re-run this script to retry any FAILED jobs (they resume from checkpoints)."
-echo "Summary: python scripts/attend/summarize_stargraph.py $OUT_ROOT/$GRAPH"
+[ "$GRAPH" = "manhattan" ] || echo "Summary: python scripts/attend/summarize_stargraph.py $OUT_ROOT/$GRAPH"

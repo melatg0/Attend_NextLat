@@ -1,0 +1,6 @@
+# Manhattan training + evaluation: the Path-Star set plus the map libraries the
+# data/manhattan evaluation scripts import (versions pinned as in requirements.txt).
+-r requirements-stargraph.txt
+osmnx==1.9.3
+networkx==3.3
+folium==0.16.0
