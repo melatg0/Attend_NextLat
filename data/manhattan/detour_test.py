@@ -52,6 +52,13 @@ if __name__ == "__main__":
     parser.add_argument("--detour-prob", type=float, default=0.75)
     parser.add_argument("--num-trials", type=int, default=100)
     parser.add_argument(
+        "--paired",
+        action="store_true",
+        help="Give trial i its own RNG seeded by (scenario-seed, i), so every model sees the same trips "
+        "and detour coin flips (the default global RNG drifts with each model's own path lengths)",
+    )
+    parser.add_argument("--scenario-seed", type=int, default=0)
+    parser.add_argument(
         "--detour-type",
         type=str,
         default="random_valid",
@@ -109,7 +116,8 @@ if __name__ == "__main__":
     success_nodes = 0
     reached_nodes = 0
     for index in bar:
-        pairs = all_pairs[np.random.choice(len(all_pairs), size=1)]
+        rng = np.random.default_rng([args.scenario_seed, index]) if args.paired else np.random
+        pairs = all_pairs[rng.choice(len(all_pairs), size=1)]
         input_ids = torch.tensor(
             [tokenizer.encode(" ".join([str(x) for x in list(pair)])) for pair in pairs]
         ).to(device)
@@ -143,7 +151,7 @@ if __name__ == "__main__":
             transformer_pred = torch.argmax(probs[0, -1, :])
             # Insert detour with probability detour_prob
             if (
-                np.random.rand() < args.detour_prob
+                rng.random() < args.detour_prob
                 and state != destination
                 and len(turn_options) > 0
             ):
@@ -174,7 +182,7 @@ if __name__ == "__main__":
                         next_token = (
                             torch.tensor(
                                 tokenizer.encode(
-                                    np.random.choice(turn_options_except_pred)
+                                    rng.choice(turn_options_except_pred)
                                 )
                             )
                             .unsqueeze(0)
@@ -232,7 +240,7 @@ if __name__ == "__main__":
         reached_end, is_valid = is_valid_sequence(
             path, valid_turns, node_and_direction_to_neighbor
         )
-        print(f"Reached end: {reached_end}, is valid: {is_valid}")
+        print(f"Trial {index}: Reached end: {reached_end}, is valid: {is_valid}")
         print(f"Path: {path}")
         total_nodes += 1
         if is_valid:
