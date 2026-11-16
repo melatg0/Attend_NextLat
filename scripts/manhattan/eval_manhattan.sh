@@ -10,6 +10,7 @@
 # Usage (repo root; needs scripts/manhattan/prepare_data.py to have run):
 #   bash scripts/manhattan/eval_manhattan.sh <ckpt.pt> [name]
 #   QUICK=1 bash scripts/manhattan/eval_manhattan.sh <ckpt.pt>    # tiny sizes, for smoke tests
+#   PARSE_ONLY=1 bash scripts/manhattan/eval_manhattan.sh <ckpt.pt>  # rebuild metrics.json from existing logs
 # Output: <experiment_dir>/manhattan_eval_<ckpt>[_quick]/{*.log,metrics.json}
 set -uo pipefail
 
@@ -45,6 +46,7 @@ run() {  # run <step> <command...>: log to $OUT/<step>.log, never abort the rema
 }
 # fabric run's default port (29400) clashes with concurrent training or a second eval: use a free one
 PORT=$(python -c "import socket; s = socket.socket(); s.bind(('', 0)); print(s.getsockname()[1])")
+if [ "${PARSE_ONLY:-0}" != "1" ]; then  # PARSE_ONLY=1: only rebuild metrics.json from existing logs
 run 1_trajectories fabric run --devices 1 --main-port "$PORT" data/manhattan/generate_manhattan_trajectories.py \
     "${GEN[@]}" "${COMMON[@]}" "${OVERRIDES[@]}"
 run 2_map_reconstruction bash -c "cd data/manhattan && python make_graphs.py --dataset random_walks \
@@ -52,23 +54,26 @@ run 2_map_reconstruction bash -c "cd data/manhattan && python make_graphs.py --d
 run 3_sequence_compression python data/manhattan/sequence_compression.py "${COMP[@]}" "${COMMON[@]}" "${OVERRIDES[@]}"
 run 4_detour python data/manhattan/detour_test.py "${DETOUR[@]}" "${COMMON[@]}" "${OVERRIDES[@]}"
 run 5_latent_rank python data/manhattan/latent_compression.py "${LATENT[@]}" "${COMMON[@]}" "${OVERRIDES[@]}"
+fi
 
 python - "$OUT" "$CKPT" <<'EOF'
 import json, os, re, sys
 out, ckpt = sys.argv[1], sys.argv[2]
 read = lambda step: open(os.path.join(out, f"{step}.log"), errors="replace").read() if os.path.exists(os.path.join(out, f"{step}.log")) else ""
+# Last match: progress bars print running values (starting at 0.000) before the final result line
+last = lambda pattern, text: (list(re.finditer(pattern, text)) or [None])[-1]
 m, num = {"checkpoint": ckpt}, r"([-+0-9.eE]+)"
-if g := re.search(rf"FINAL generation: n=(\d+) reached_end={num} valid={num}", read("1_trajectories")):
+if g := last(rf"FINAL generation: n=(\d+) reached_end={num} valid={num}", read("1_trajectories")):
     m.update(trajectories_n=int(g[1]), trajectories_reached_end=float(g[2]), trajectories_valid=float(g[3]))
-if g := re.search(r"New edges, True edges, Unused true edges\s+(\d+) (\d+) (\d+)", read("2_map_reconstruction")):
+if g := last(r"New edges, True edges, Unused true edges\s+(\d+) (\d+) (\d+)", read("2_map_reconstruction")):
     m.update(map_new_edges=int(g[1]), map_true_edges=int(g[2]), map_unused_true_edges=int(g[3]))
-if g := re.search(rf"Mean compression precision: {num} \({num}\)", read("3_sequence_compression")):
+if g := last(rf"Mean compression precision: {num} \({num}\)", read("3_sequence_compression")):
     m.update(compression_precision=float(g[1]), compression_precision_std=float(g[2]))
-if g := re.search(rf"FINAL detour: .*? n=(\d+) valid={num} valid_std={num} reached_end={num}", read("4_detour")):
+if g := last(rf"FINAL detour: .*? n=(\d+) valid={num} valid_std={num} reached_end={num}", read("4_detour")):
     m.update(detour_n=int(g[1]), detour_valid=float(g[2]), detour_valid_std=float(g[3]), detour_reached_end=float(g[4]))
 log = read("5_latent_rank")
-if g := re.search(rf"Mean participation ratio: {num}", log): m["participation_ratio"] = float(g[1])
-if g := re.search(rf"Mean effective rank: {num}", log): m["effective_rank"] = float(g[1])
+if g := last(rf"Mean participation ratio: {num}", log): m["participation_ratio"] = float(g[1])
+if g := last(rf"Mean effective rank: {num}", log): m["effective_rank"] = float(g[1])
 expected = ["trajectories_valid", "map_true_edges", "compression_precision", "detour_valid", "effective_rank"]
 m["missing"] = [k for k in expected if k not in m]
 json.dump(m, open(os.path.join(out, "metrics.json"), "w"), indent=2)
