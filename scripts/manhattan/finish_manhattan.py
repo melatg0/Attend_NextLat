@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "attend"))
 from summarize_stargraph import last_value, load_run  # noqa: E402
@@ -70,6 +71,11 @@ def main():
         ckpt = final_checkpoint(exp_dir)
         suffix = "_quick" if args.quick else ""
         metrics_path = os.path.join(exp_dir, f"manhattan_eval_{os.path.basename(ckpt)[:-3]}{suffix}", "metrics.json")
+        running = os.path.join(os.path.dirname(metrics_path), "RUNNING")
+        if os.path.isfile(running):  # another process (e.g. sweep_manhattan.py) is evaluating it
+            print(f"[wait] {ckpt}: eval already running", flush=True)
+            while os.path.isfile(running):
+                time.sleep(60)
         if not os.path.isfile(metrics_path):
             print(f"[eval] {ckpt}", flush=True)
             env = dict(os.environ, QUICK="1" if args.quick else "0")

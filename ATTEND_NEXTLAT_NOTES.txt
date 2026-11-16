@@ -121,3 +121,11 @@ Evaluations (scripts/manhattan/eval_manhattan.sh <ckpt>, paper Table 1; results 
   detour_valid / _reached_end        random valid detours with p=0.75 (valid = every turn legal)
   effective_rank, participation_ratio  hidden-state compactness
 During training: generalization/test_accuracy and valid_accuracy, val/valid_accuracy, val/nsl1_step_k.
+
+Checkpoint sweep (scripts/manhattan/sweep_manhattan.py): does lower latent error go with better
+compression and detour robustness, or only with a better auxiliary objective? At matched checkpoints
+(default 100k, 150k, 200k, final) it runs paired detour evals (1,000 trials) and, at 150k/200k,
+compression + effective rank, then tabulates them next to val/nsl1 with a McNemar test per step.
+Paired detours (detour_test.py --paired) seed each trial separately, so all models get the same trips
+and detour decisions; the default global RNG drifts apart with each model's path lengths. Compression
+trials are already shared across models (prefixes come from numpy before the model samples with torch).
