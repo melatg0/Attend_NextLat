@@ -1,0 +1,75 @@
+# Attend-NextLat Manhattan taxi rides: variant "nextlat".
+# Derived from config/manhattan/nextlat_manhattan.yaml with its tuned sweep values written in
+# (mtp_horizon 8, lambda_mse 1.0, lambda_kl 0.1, proj_factor 2.0) and no sweep:
+# scripts/runpod/launch_runs.sh passes seed=<S> and a per-run out_dir.
+use_nextlat: true
+seed: 1234
+
+trainer:
+  epochs: -1
+  # Paper schedule (its reported checkpoint is step 255k). Override trainer.train_batches for a
+  # shorter schedule; keep_checkpoint_steps beyond it are simply never reached.
+  train_batches: 400000
+  # Validation loss on a fixed 50-batch sample of the 908k-trip heldout split (the full split
+  # would take minutes every 1000 steps); task metrics come from the trajectory evals below.
+  val_batches: 50
+  # Trajectory evals during training: 1,000 heldout trips + generalization_num_samples x batch pairs
+  test_batches: -1
+  val_only: false
+  val_printsamples: false
+  log_interval: 10
+  val_interval: 1000
+  test_interval: 1000
+  out_dir: output/attend/manhattan/nextlat
+  init_from: scratch
+  wandb_project: attend-nextlat-manhattan
+  # compile ON for every variant (see ATTEND_NEXTLAT_NOTES.txt, torch.compile finding)
+  compile: true
+  experiment_name: NextLat-baseline
+  wandb_tags: ["manhattan", "nextlat"]
+  save_last_checkpoint: true
+  save_best_checkpoint: false
+  always_save_checkpoint: false
+  keep_checkpoint_steps: [25000, 50000, 100000, 150000, 200000, 255000, 300000, 400000]
+  save_recovery_checkpoint: 2000
+data:
+  dataset: manhattan
+  effective_batch_size: 256
+  # 2 micro-batches of 128 = the paper's batch of 256 per update (same math): the learned gate
+  # ran out of 80 GB at micro-batch 256, and the baseline peaked at 71 GB
+  gradient_accum_steps: 2
+  pair_accum_steps: 1
+  num_workers: 1
+  test_generalization: true
+  generalization_num_samples: 20
+  data_path: "data/manhattan/random_walks"
+  use_pretokenized: true
+
+model:
+  n_layer: 48
+  n_head: 8
+  n_embd: 384
+  dropout: 0.0
+  bias: false
+  vocab_size: 0 #will be overwritten by datamodule
+  block_size: 256
+  context_length: 0
+  gpt_mode: next_token
+  mtp_horizon: 8
+  lambda_mse: 1.0
+  lambda_kl: 0.1
+  proj_factor: 2.0
+  head_specific_dynamics: false
+  head_uniform_gate: false
+
+optimizer:
+  optimizer_type: adam
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: null
+
+lr_scheduler:
+  warmup_iters: 0
+  warmdown_iters: 0

@@ -1,0 +1,71 @@
+# Attend-NextLat Path-Star G(7,7): variant "learned".
+# Derived from config/stargraph/7_7/nextlat_stargraph_7_7.yaml (same model/optimizer/horizon),
+# without the seed sweep: scripts/runpod/launch_stargraph.sh passes seed=<S> and a per-run out_dir.
+use_nextlat: true
+seed: 1234
+
+trainer:
+  epochs: -1
+  train_batches: 20000
+  # Frequent eval on a fixed 10-batch (5,120-graph) slice of the test set; full test set via
+  # scripts/runpod/finish_and_notify.py (or eval_stargraph.sh with trainer.test_batches=200)
+  val_batches: 10
+  test_batches: 10
+  val_only: false
+  val_printsamples: false
+  log_interval: 1
+  val_interval: 250
+  test_interval: 250
+  out_dir: output/attend/7_7/learned
+  init_from: scratch
+  wandb_project: attend-nextlat-stargraph
+  # compile ON: with compile off, G(7,7) seed 1234 memorized (0% solve); with it on (as in the
+  # original configs) the baseline generalized and reproduced the paper (~90%). Keep identical across variants.
+  compile: true
+  experiment_name: Attend-learned
+  wandb_tags: ["7_7", "learned"]
+  # Checkpointing: final + fixed milestones for post-hoc analysis; recovery for pod restarts.
+  save_last_checkpoint: true
+  save_best_checkpoint: false
+  keep_checkpoint_steps: [5000, 10000, 15000, 20000]
+  save_recovery_checkpoint: 1000
+data:
+  dataset: stargraph
+  effective_batch_size: 512
+  gradient_accum_steps: 1
+  pair_accum_steps: 1
+  num_workers: 0
+  stargraph_train_data_path: "data/stargraph/graph_7_7_sample_200000.txt"
+  stargraph_test_data_path: "data/stargraph/graph_7_7_test_20000.txt"
+  stargraph_max_nodes: 100
+  test_generalization: false
+  stargraph_generalization_data_path: []
+
+model:
+  n_layer: 12
+  n_head: 6
+  n_embd: 384
+  dropout: 0.0
+  bias: false
+  vocab_size: 0 #will be overwritten by datamodule
+  block_size: 1024
+  context_length: 0
+  gpt_mode: next_token
+  lambda_kl: 1.0
+  mtp_horizon: 5
+  lambda_mse: 1.0
+  proj_factor: 0.5
+  head_specific_dynamics: true
+  head_uniform_gate: false
+
+optimizer:
+  optimizer_type: adam
+  learning_rate: 5e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 100
+
+lr_scheduler:
+  warmup_iters: 0
+  warmdown_iters: 0

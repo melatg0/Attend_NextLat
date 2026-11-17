@@ -1,0 +1,131 @@
+Attend-NextLat implementation notes
+===================================
+
+Why:
+The original NextLat predicts its next latent state with one MLP from
+(current hidden state, next-token embedding). This experiment tests whether
+separate, token-conditioned attention-head updates and a learned gate form
+a better inductive bias for latent dynamics and long-horizon consistency.
+
+What changed:
+- models/model_gpt.py: CausalSelfAttention/Block optionally return per-head
+  outputs before the attention output projection; existing callers are unchanged.
+- models/model_nextlat.py: opt-in HeadSpecificDynamicsModel has an independent
+  MLP per final-layer attention head, a shared next-token projection, softmax
+  gating (or uniform weights), a combining MLP, and a residual state update.
+  First-step dynamics use actual head outputs. Later rollout steps project
+  predicted latent states into proxy head features, avoiding new transformer
+  passes. Training returns extra head activations and propagates their gradients
+  back into the transformer. NextLat CE, Smooth L1, and KL losses are retained.
+- core_train.py and defaults.yaml: expose head_specific_dynamics (default false)
+  and head_uniform_gate (default false) to experiments. The original NextLat
+  baseline stays selectable without code changes.
+
+How to use:
+Set use_nextlat: true and model.head_specific_dynamics: true in a copied YAML
+training configuration. Use model.head_uniform_gate: true for the no-learned-gate
+ablation. To reproduce the baseline, set head_specific_dynamics: false.
+Run via the repository's usual train.py commands. Use compile: true (see the
+torch.compile finding below); the head-specific path is validated compiled.
+
+Limitations and checks:
+- Projected head features after the first step are learned proxies, not actual
+  future attention outputs. Their usefulness must be evaluated.
+- Predictor parameter count is approximately matched by selecting the combining
+  MLP's width; record exact parameter counts per experimental configuration.
+- This commit changes architecture and configuration only; it does not prove
+  better accuracy, equal FLOPs, or runtime feasibility. Run smoke tests, then
+  compare baseline/learned/uniform gating with the same seeds and horizons.
+
+Running the Path-Star experiments (RunPod)
+==========================================
+Configs: config/stargraph/{5_5,7_7}/attend/{nextlat,learned,uniform}_stargraph_<graph>.yaml
+(baseline / learned gate / uniform gate). Same settings as the paper (Appendix F.3, Table 7) plus
+compile: true, eval every 250 steps on a fixed 5,120-graph test slice, and no seed sweep (the
+launcher passes seeds and a per-run out_dir so runs never share checkpoint pointers).
+
+On the pod (PyTorch >= 2.6 image, repo at /workspace/Attend_NextLat, WANDB_API_KEY from a RunPod
+secret; in SSH sessions run `source /etc/rp_environment` first):
+  SKIP_GIT=1 bash scripts/runpod/setup.sh 7_7      # deps, data, unit tests (SKIP_GIT if code was rsynced)
+  bash scripts/runpod/smoke.sh 7_7                 # short check of all variants + resume + eval
+  tmux new -s runs
+  bash scripts/runpod/launch_runs.sh 7_7 1         # 3 variants x seeds 1234-1236, 1 job per GPU
+  python scripts/runpod/finish_and_notify.py --root output/attend/7_7 --name results-7_7
+Re-running the launcher skips finished runs (DONE marker) and resumes the rest. One job already
+keeps an H100 ~75-80% busy; running several jobs per GPU does not raise total throughput.
+finish_and_notify.py evaluates final checkpoints on the full test set, writes a summary table,
+uploads table/evals/configs to W&B, and sends a W&B alert (emailed if "Scriptable run alerts" is on).
+
+Outputs: <out_root>/<graph>/<variant>/seed<S>/<experiment>/ckpt_iter_{5000,10000,15000,20000,20001}.pt,
+materialized_config.yaml, version_*/metrics.csv; the final checkpoint is also uploaded as a W&B
+model artifact (project attend-nextlat-stargraph).
+
+Metrics (W&B / CSV): val_(k, l)/test_accuracy = solve rate; val_(k, l)/token_2 = first-step accuracy
+from the center (token_1 is the center node, copied from the prompt); nsl1_step_k = smooth L1 /
+mean per-dim variance of true latents at rollout step k (~0.5 = no better than predicting the mean);
+gate/entropy_step_k (normalized to [0,1]), gate/w_head{h} (step-1 mean weight per head);
+params/dynamics_model for parity checks.
+
+Analysis:
+  python scripts/attend/summarize_stargraph.py <out_root>/7_7        # mean +- std, steps to 95%
+  bash scripts/attend/eval_stargraph.sh <ckpt.pt> [overrides]         # post-hoc eval -> eval_results.json
+  bash scripts/attend/eval_stargraph.sh <ckpt.pt> model.head_uniform_gate=true   # test-time gate ablation
+
+torch.compile finding
+=====================
+The README recommends compile: false for Path-Star. On one H100 NVL (PyTorch 2.8), the NextLat
+baseline on G(7,7), seed 1234, with compile: false memorized the training graphs: test loss rose
+after ~2.5k steps and the solve rate stayed at 0% through 17k steps. With compile: true (as in the
+original configs), the same seed generalized and reached 96.9% (paper: ~90%). Training is also ~2x
+faster compiled. All variants are therefore run compiled. G(5,5) is solved by ~2k steps either way.
+
+Results so far: G(7,7), seed 1234, compiled (full 19,968-graph test set)
+=======================================================================
+  variant             solve   first-step  steps to 90% / 95%   val nsl1 (step 1 / step 5)
+  NextLat baseline    96.9%   97.5%       9,750 / 11,250       0.106 (0.064 / 0.141)
+  Attend, learned     94.5%   95.4%       4,500 /  6,250       0.061 (0.033 / 0.087)
+  Attend, uniform     81.6%   83.1%       never / never        0.068 (0.041 / 0.097)
+Learned gate: ~2x faster to 90%, ~43% lower latent error, slightly lower final solve rate; gate
+entropy 0.69 (moved away from uniform). One seed only: confirm with seeds 1235/1236.
+W&B: project attend-nextlat-stargraph, artifact results-7_7-seed1234.
+
+Running the Manhattan experiments (RunPod)
+==========================================
+Configs: config/manhattan/attend/{nextlat,learned}_manhattan.yaml. Paper settings (48 layers, 8 heads,
+width 384, batch 256, block 256, lr 1e-4, wd 0.01, no grad clip) with the original config's tuned
+sweep values written in (mtp_horizon 8, lambda_mse 1.0, lambda_kl 0.1, proj_factor 2.0), compile on,
+validation loss on a fixed 50-batch heldout sample (the full 908k-trip split takes minutes), and a
+400k-step schedule (override trainer.train_batches for a shorter run). Predictor parameters:
+4,129,536 (baseline) vs 4,129,729 (head-specific).
+
+Per-head sizing rule (model.head_param_share): the per-head MLPs hold a fixed share of the baseline
+predictor's parameter budget and the combiner MLP takes the rest, so the total always matches the
+baseline. Share 0.25 is used because the original fixed width (2 * head_dim) gives exactly 25% on the
+Path-Star configs (per-head width 128; those runs are bitwise identical under either rule). With the
+fixed width, Manhattan's 7x larger budget would leave the heads 2.7% and the combiner 93%; with share
+0.25 the heads get 25% (per-head width 896), the state-to-heads projection 3.6%, the combiner 71%.
+
+Pod: GPUs + a network volume at /workspace (runs take days; HF dataset ~20 GB is cached there).
+  SKIP_GIT=1 bash scripts/runpod/setup.sh manhattan    # deps (+osmnx), artifacts, dataset, heldout text
+  bash scripts/manhattan/smoke_manhattan.sh            # 400-step train/resume + all evals, speed/memory
+  bash scripts/runpod/launch_runs.sh manhattan 1       # nextlat + learned, seed 1234, one GPU each
+  python scripts/manhattan/finish_manhattan.py         # evals on final checkpoints, table, W&B, alert
+scripts/manhattan/prepare_data.py rebuilds data/manhattan/random_walks/heldout_sequences.txt (needed by
+latent_compression.py, otherwise only available via the Google Drive download) by decoding the
+pretokenized heldout split; re-encoding is checked against the original token ids.
+
+Evaluations (scripts/manhattan/eval_manhattan.sh <ckpt>, paper Table 1; results in metrics.json):
+  trajectories_valid / _reached_end  6,400 generated trips between heldout pairs (shortest path <= 50)
+  map_true_edges / map_new_edges     street map rebuilt from those trips (downloads the OSM graph)
+  compression_precision              sequence compression test
+  detour_valid / _reached_end        random valid detours with p=0.75 (valid = every turn legal)
+  effective_rank, participation_ratio  hidden-state compactness
+During training: generalization/test_accuracy and valid_accuracy, val/valid_accuracy, val/nsl1_step_k.
+
+Checkpoint sweep (scripts/manhattan/sweep_manhattan.py): does lower latent error go with better
+compression and detour robustness, or only with a better auxiliary objective? At matched checkpoints
+(default 100k, 150k, 200k, final) it runs paired detour evals (1,000 trials) and, at 150k/200k,
+compression + effective rank, then tabulates them next to val/nsl1 with a McNemar test per step.
+Paired detours (detour_test.py --paired) seed each trial separately, so all models get the same trips
+and detour decisions; the default global RNG drifts apart with each model's path lengths. Compression
+trials are already shared across models (prefixes come from numpy before the model samples with torch).

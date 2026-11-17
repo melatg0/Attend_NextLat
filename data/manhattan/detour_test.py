@@ -15,11 +15,12 @@ from argparse import ArgumentParser
 from omegaconf import OmegaConf, DictConfig
 from collections import defaultdict
 
-# Add the root directory to Python path to import core_train
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+# Put the repo root first on the path: the script's own folder has a utils.py that would
+# otherwise shadow the repo's utils package (imported by the model code via core_train)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from core_train import initialize_model
 from data.manhattan import is_valid_sequence
-import utils
+from data.manhattan import utils  # local helpers, not the repo's utils package
 
 
 if __name__ == "__main__":
@@ -50,6 +51,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--detour-prob", type=float, default=0.75)
     parser.add_argument("--num-trials", type=int, default=100)
+    parser.add_argument(
+        "--paired",
+        action="store_true",
+        help="Give trial i its own RNG seeded by (scenario-seed, i), so every model sees the same trips "
+        "and detour coin flips (the default global RNG drifts with each model's own path lengths)",
+    )
+    parser.add_argument("--scenario-seed", type=int, default=0)
     parser.add_argument(
         "--detour-type",
         type=str,
@@ -106,8 +114,10 @@ if __name__ == "__main__":
     bar = tqdm(range(args.num_trials))
     total_nodes = 0
     success_nodes = 0
+    reached_nodes = 0
     for index in bar:
-        pairs = all_pairs[np.random.choice(len(all_pairs), size=1)]
+        rng = np.random.default_rng([args.scenario_seed, index]) if args.paired else np.random
+        pairs = all_pairs[rng.choice(len(all_pairs), size=1)]
         input_ids = torch.tensor(
             [tokenizer.encode(" ".join([str(x) for x in list(pair)])) for pair in pairs]
         ).to(device)
@@ -141,7 +151,7 @@ if __name__ == "__main__":
             transformer_pred = torch.argmax(probs[0, -1, :])
             # Insert detour with probability detour_prob
             if (
-                np.random.rand() < args.detour_prob
+                rng.random() < args.detour_prob
                 and state != destination
                 and len(turn_options) > 0
             ):
@@ -172,7 +182,7 @@ if __name__ == "__main__":
                         next_token = (
                             torch.tensor(
                                 tokenizer.encode(
-                                    np.random.choice(turn_options_except_pred)
+                                    rng.choice(turn_options_except_pred)
                                 )
                             )
                             .unsqueeze(0)
@@ -230,13 +240,22 @@ if __name__ == "__main__":
         reached_end, is_valid = is_valid_sequence(
             path, valid_turns, node_and_direction_to_neighbor
         )
-        print(f"Reached end: {reached_end}, is valid: {is_valid}")
+        print(f"Trial {index}: Reached end: {reached_end}, is valid: {is_valid}")
         print(f"Path: {path}")
         total_nodes += 1
         if is_valid:
             success_nodes += 1
+        if reached_end:
+            reached_nodes += 1
         success_rate = success_nodes / total_nodes
         std = np.sqrt(success_rate * (1 - success_rate) / total_nodes)
         bar.set_description(
             f"Fraction successful {args.data_dir} ({args.detour_type} detours, p={args.detour_prob}): {success_rate:.3f} ({std:.3f})"
         )
+
+    # Final summary on one parseable line (the progress bar is not logged reliably).
+    # "valid" (every turn legal) is the detour-robustness metric used by the original code.
+    print(
+        f"FINAL detour: type={args.detour_type} p={args.detour_prob} n={total_nodes} "
+        f"valid={success_rate:.4f} valid_std={std:.4f} reached_end={reached_nodes/total_nodes:.4f}"
+    )

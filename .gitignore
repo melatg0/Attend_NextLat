@@ -12,3 +12,5 @@ env/
 venv/ 
 wandb/
 .venv/
+# experiment outputs (checkpoints, logs)
+output/

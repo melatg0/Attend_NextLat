@@ -14,11 +14,12 @@ import lightning as L
 from argparse import ArgumentParser
 from omegaconf import OmegaConf, DictConfig
 
-# Add the root directory to Python path to import core_train
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+# Put the repo root first on the path: the script's own folder has a utils.py that would
+# otherwise shadow the repo's utils package (imported by the model code via core_train)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from core_train import initialize_model
 from data.manhattan_dataset import is_valid_sequence
-import utils
+from data.manhattan import utils  # local helpers, not the repo's utils package
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Load a model checkpoint")
@@ -135,6 +136,12 @@ if __name__ == "__main__":
         bar.set_description(
             f"Fraction successful: {num_successful/total_nodes:.2f} ({num_successful}/{total_nodes}), Fraction valid: {num_valid/total_nodes:.2f} ({num_valid}/{total_nodes})"
         )
+
+    # Final summary on one parseable line (the progress bar is not logged reliably)
+    print(
+        f"FINAL generation: n={total_nodes} reached_end={num_successful/total_nodes:.4f} "
+        f"valid={num_valid/total_nodes:.4f}"
+    )
 
     # Save samples
     os.makedirs(f"{args.data_dir}/samples", exist_ok=True)

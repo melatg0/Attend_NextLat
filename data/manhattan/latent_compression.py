@@ -14,8 +14,9 @@ import lightning as L
 from argparse import ArgumentParser
 from omegaconf import OmegaConf, DictConfig
 
-# Add the root directory to Python path to import core_train
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+# Put the repo root first on the path: the script's own folder has a utils.py that would
+# otherwise shadow the repo's utils package (imported by the model code via core_train)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from core_train import initialize_model
 from data.manhattan_dataset import (
     is_valid_sequence,

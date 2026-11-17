@@ -1,0 +1,12 @@
+# Slim dependency set for Path-Star training/eval (everything train.py imports at load time).
+# torch>=2.6 is expected to come from the RunPod PyTorch image; setup.sh checks the version.
+lightning>=2.4
+omegaconf>=2.3.0
+wandb
+transformers
+datasets==4.6.1
+huggingface_hub
+scikit-learn
+tqdm
+pyyaml
+numpy

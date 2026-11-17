@@ -2,6 +2,7 @@
 
 import gc
 import inspect
+import json
 import math
 import os
 import time
@@ -92,6 +93,9 @@ def initialize_model(
             "lambda_mse": config.model.lambda_mse,
             "lambda_ce": config.model.lambda_ce,
             "proj_factor": config.model.proj_factor,
+            "head_specific_dynamics": config.model.head_specific_dynamics,
+            "head_uniform_gate": config.model.head_uniform_gate,
+            "head_param_share": config.model.get("head_param_share", None),
             "compute_hidden_state_rank": config.model.compute_hidden_state_rank,
         }
     elif config.use_mtp_gloeckle:
@@ -141,25 +145,23 @@ def initialize_model(
         recovery_ckpt_pointer = os.path.join(config.trainer.out_dir, "recovery_ckpt")
         latest_ckpt_pointer = os.path.join(config.trainer.out_dir, "latest_ckpt")
 
-        # Use the recovery checkpoint if it exists
-        if os.path.isfile(recovery_ckpt_pointer):
-            with open(recovery_ckpt_pointer, "r") as f:
-                checkpoint_path = f.read().strip()
-            assert os.path.isfile(
-                checkpoint_path
-            ), f"Checkpoint file {checkpoint_path} does not exist"
-            fabric.print(f"Resuming from recovery checkpoint {checkpoint_path}")
+        # Collect recovery and validation checkpoints; resume from the most recent one
+        candidates = []
+        for kind, pointer in (
+            ("recovery", recovery_ckpt_pointer),
+            ("previous validation", latest_ckpt_pointer),
+        ):
+            if os.path.isfile(pointer):
+                with open(pointer, "r") as f:
+                    path = f.read().strip()
+                if os.path.isfile(path):
+                    candidates.append((os.path.getmtime(path), kind, path))
+                else:
+                    fabric.print(f"Ignoring {pointer}: {path} does not exist")
 
-        # Otherwise, use the latest validation checkpoint if it exists
-        elif os.path.isfile(latest_ckpt_pointer):
-            with open(latest_ckpt_pointer, "r") as f:
-                checkpoint_path = f.read().strip()
-            assert os.path.isfile(
-                checkpoint_path
-            ), f"Checkpoint file {checkpoint_path} does not exist"
-            fabric.print(
-                f"Resuming from previous validation checkpoint {checkpoint_path}"
-            )
+        if candidates:
+            _, kind, checkpoint_path = max(candidates)
+            fabric.print(f"Resuming from {kind} checkpoint {checkpoint_path}")
 
         # If no checkpoint file is found, initialize a new model
         else:
@@ -363,15 +365,33 @@ class Trainer:
             self.fabric.print("Running validation only, not training model")
             validation_logs = self._validation_loop()
             self.fabric.print(validation_logs)
+            if self.fabric.global_rank == 0:
+                results_path = os.path.join(
+                    self.config.trainer.out_dir,
+                    self.config.trainer.experiment_name,
+                    "eval_results.json",
+                )
+                os.makedirs(os.path.dirname(results_path), exist_ok=True)
+                with open(results_path, "w") as f:
+                    json.dump(
+                        {"step": self.step, **validation_logs}, f, indent=2, default=float
+                    )
+                self.fabric.print(f"Wrote evaluation results to {results_path}")
         else:
+            self._log_param_counts()
             self.fabric.print(f"Starting training from step={self.step}")
             self._train_loop()
 
             self.fabric.print("Training complete, running final validation")
             val_logs = self._validation_loop()
+            # Log the final validation (it falls outside the training loop's logging)
+            self.fabric.log_dict({"step": self.step, **val_logs}, step=self.step)
 
             # Save final model checkpoint as wandb artifact
             if self.config.trainer.log_to_wandb and self.fabric.global_rank == 0:
+                if wandb.run is not None:
+                    for k, v in val_logs.items():
+                        wandb.run.summary[f"final/{k}"] = v
                 # Initialize wandb artifact
                 artifact = wandb.Artifact(
                     name=self.config.trainer.experiment_name,
@@ -406,6 +426,23 @@ class Trainer:
                         f"Warning: {latest_ckpt_pointer} file not found, not saving wandb artifact"
                     )
                 wandb.finish()
+
+    def _log_param_counts(self):
+        """
+        Log parameter counts once so predictor-capacity parity can be checked per run.
+        """
+        dynamics_params = sum(
+            p.numel()
+            for name, p in self.model.model.named_parameters()
+            if "dynamics_model." in name
+        ) if hasattr(self.model, "model") else 0
+        counts = {
+            "params/total": self.model.get_num_params(non_embedding=False),
+            "params/non_embedding": self.model.get_num_params(non_embedding=True),
+            "params/dynamics_model": dynamics_params,
+        }
+        self.fabric.print(f"Parameter counts: {counts}")
+        self.fabric.log_dict({"step": self.step, **counts}, step=self.step)
 
     def _train_loop(self):
         """
@@ -549,7 +586,7 @@ class Trainer:
                         log_dict["grad_norm"] = grad_norm
 
                     log_dict.update(self._next_token_perplexity_metrics(log_dict))
-                    self.fabric.log_dict(log_dict)
+                    self.fabric.log_dict(log_dict, step=self.step)
                     speed_window_train_time = 0.0
                     speed_window_train_steps = 0
 
@@ -668,7 +705,10 @@ class Trainer:
             validation_logs["val/prev_token_loss"] = val_loss_prev_token
 
         # Modular accuracy evaluation
-        if self.step % self.config.trainer.test_interval == 0 and self.step > 0:
+        # Always run task accuracy eval in val_only mode (post-hoc checkpoint evaluation)
+        if (
+            self.step % self.config.trainer.test_interval == 0 and self.step > 0
+        ) or self.config.trainer.val_only:
             # StarGraph
             if self.config.data.dataset == "stargraph":
                 # Import and call evaluate_stargraph
