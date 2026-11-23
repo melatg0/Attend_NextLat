@@ -137,3 +137,18 @@ loss 0.7292 vs 0.7293. Over training (paired 1,000-trial detours), learned has 2
 at every checkpoint, but its effective rank stays ~125 while nextlat's falls 97 -> 83, and its detour
 validity trails by 5.6 points at 100k and 2-3 points from 150k to 255k (88.4% vs 85.5%, McNemar
 p = 0.048). Training took 25.8 h (nextlat) and 29.3 h (learned) on one H100 NVL each.
+
+Head/combiner allocation sweep (planned)
+========================================
+Question: at a fixed predictor size, does giving the per-head MLPs a smaller or larger share of it
+change the result? Configs config/manhattan/attend/learned_share{010,050}_manhattan.yaml: learned
+gate, head_param_share 0.10 / 0.50 (per-head width 358 / 1792, combiner width 4624 / 2473, same
+4,129,729 predictor parameters), otherwise identical to the share-0.25 run. One seed (1234), 255k
+steps, one GPU per run, so the earlier nextlat and share-0.25 runs are matched controls (same code,
+data order and hardware type). This changes how capacity is split, not what the predictor reads: every
+share still sees the final-layer head outputs. One seed makes the comparison exploratory.
+On a 2-GPU pod (repo at /workspace/Attend_NextLat), copy the earlier runs' results first
+(output/results/manhattan_seed1234/{nextlat,learned} -> output/attend/manhattan/), then:
+  tmux new -d -s autopilot "bash scripts/manhattan/autopilot_manhattan.sh"
+It runs setup, the smoke test, both trainings, the checkpoint sweep against nextlat and share 0.25
+(sweep_manhattan.py --compare/--reference, Holm-adjusted McNemar per reference) and the final evals.
