@@ -16,15 +16,23 @@ run is DONE (or immediately without a variant). Several slots per GPU are fine: 
 batch size 1 and leave the GPU mostly idle. Resumable: jobs whose metrics.json exists are skipped.
 
 Then a table per (step, variant): validation latent error (training CSV, last value at or before the
-step), compression, effective rank, paired detour validity, and an exact McNemar p-value comparing the
-first two variants on the same detour trials. Written to <root>/summary/<name>.{md,json}, uploaded to
-W&B with an alert.
+step), compression, effective rank, paired detour validity, and for every variant against each
+--reference the paired detour difference (points) with exact McNemar p-values, raw and Holm-adjusted
+over the comparisons at that step. --compare adds already-evaluated runs to the table only (their
+checkpoints may be gone: eval folders and training CSVs are enough). Written to
+<root>/summary/<name>.{md,json}, uploaded to W&B with an alert.
 
 Usage (repo root, on the pod):
     python scripts/manhattan/sweep_manhattan.py --steps 100000 150000 200000 final \
         --compression-steps 150000 200000 --final-full nextlat \
         --slot 0:nextlat --slot 0:nextlat --slot 0:nextlat --slot 1:learned --slot 1:learned \
         --wait-for output/attend/manhattan/summary/results-manhattan-255k.json
+Head-share sweep (new runs vs the earlier nextlat and share-0.25 runs, copied back into --root):
+    python scripts/manhattan/sweep_manhattan.py --variants learned_share010 learned_share050 \
+        --compare nextlat learned --reference learned nextlat --final-full learned_share010 \
+        --slot 0:learned_share010 --slot 0:learned_share010 --slot 0:learned_share010 \
+        --slot 1:learned_share050 --slot 1:learned_share050 --slot 1:learned_share050 \
+        --wait-for output/attend/manhattan/summary/results-manhattan-headshare.json --name sweep-headshare
 """
 
 import argparse
@@ -179,13 +187,44 @@ def mcnemar_p(a, b):
     return min(1.0, 2 * tail), n10, n01
 
 
+def summary_ckpt(run_dir, step):
+    """Like resolve_ckpt, but also accepts a checkpoint whose file is gone if its eval folders exist
+    (e.g. earlier runs copied back without checkpoints, to compare new runs against)."""
+    exp_dir = exp_dir_of(run_dir)
+    if exp_dir is None:
+        return None
+    steps = {ckpt_step(p) for p in glob.glob(os.path.join(exp_dir, "ckpt_iter_*.pt"))}
+    steps |= {int(m.group(1)) for d in glob.glob(os.path.join(exp_dir, "manhattan_eval_ckpt_iter_*"))
+              if (m := re.search(r"manhattan_eval_ckpt_iter_(\d+)", d))}
+    if step == "final":
+        if not os.path.isfile(os.path.join(run_dir, "DONE")) or not steps:
+            return None
+        s = max(steps)
+    else:
+        s = int(step)
+        if s not in steps:
+            return None
+    return os.path.join(exp_dir, f"ckpt_iter_{s}.pt")
+
+
+def holm(pvals):
+    """Holm-Bonferroni adjusted p-values (same order as the input)."""
+    order = sorted(range(len(pvals)), key=lambda i: pvals[i])
+    adjusted, running = [0.0] * len(pvals), 0.0
+    for rank, i in enumerate(order):
+        running = max(running, min(1.0, (len(pvals) - rank) * pvals[i]))
+        adjusted[i] = running
+    return adjusted
+
+
 def summarize(args, runs):
     rows, files = [], []
     tag = f"_paired{args.detour_trials}"
+    refs = args.reference or [runs[0][0]]
     for step in args.steps:
         trials, step_rows = {}, []
         for variant, run_dir in runs:
-            ckpt = resolve_ckpt(run_dir, step)
+            ckpt = summary_ckpt(run_dir, step)
             if ckpt is None:
                 continue
             std, det = read_metrics(ckpt), read_metrics(ckpt, tag)
@@ -205,12 +244,21 @@ def summarize(args, runs):
                 path = os.path.join(eval_dir(ckpt, t), "metrics.json")
                 if os.path.isfile(path):
                     files.append((path, f"{variant}_{s}{t}.json"))
-        names = [v for v, _ in runs if trials.get(v)]
-        if len(names) >= 2 and len(trials[names[0]]) == len(trials[names[1]]):
-            p, n10, n01 = mcnemar_p(trials[names[0]], trials[names[1]])
+        # Paired detour comparisons of every variant against each reference (same trials, in order).
+        # A reference is compared only with references listed before it, so no pair is tested twice.
+        # Holm adjustment within each reference's family of comparisons at this step.
+        for ref in refs:
+            tests = []
             for r in step_rows:
-                r["detour_mcnemar_p"] = round(p, 4)
-                r[f"detour_only_{names[0]}_valid"], r[f"detour_only_{names[1]}_valid"] = n10, n01
+                v = r["variant"]
+                if v == ref or (v in refs and refs.index(v) < refs.index(ref)):
+                    continue
+                a, b = trials.get(v), trials.get(ref)
+                if a and b and len(a) == len(b):
+                    r[f"detour_diff_vs_{ref}"] = round(100 * (sum(a) - sum(b)) / len(a), 2)  # points
+                    tests.append((r, mcnemar_p(a, b)[0]))
+            for (r, p), p_holm in zip(tests, holm([p for _, p in tests])):
+                r[f"detour_p_vs_{ref}"], r[f"detour_p_holm_vs_{ref}"] = round(p, 4), round(p_holm, 4)
         rows += step_rows
     if not rows:
         print("Nothing to summarize.")
@@ -226,14 +274,14 @@ def summarize(args, runs):
     print(md)
 
     pct = lambda v: "n/a" if v is None else f"{100 * v:.1f}%"
-    parts, pvals = {}, {}
+    parts = {}
     for r in rows:
+        vs = "".join(f" [{r[f'detour_diff_vs_{ref}']:+.1f} pts vs {ref}, Holm p={r[f'detour_p_holm_vs_{ref}']}]"
+                     for ref in refs if f"detour_diff_vs_{ref}" in r)
         parts.setdefault(r["step"], []).append(
-            f"{r['variant']} detour {pct(r['detour_valid'])}, compression {fmt(r['compression'])}, "
-            f"nsl1 {fmt(r['val_nsl1'])}")
-        if r.get("detour_mcnemar_p") is not None:
-            pvals[r["step"]] = f"; detour McNemar p={r['detour_mcnemar_p']}"
-    headline = " | ".join(f"{s}: " + "; ".join(v) + pvals.get(s, "") for s, v in parts.items())
+            f"{r['variant']} detour {pct(r['detour_valid'])}{vs}, compression {fmt(r['compression'])}, "
+            f"rank {fmt(r['effective_rank'])}, nsl1 {fmt(r['val_nsl1'])}")
+    headline = " | ".join(f"{s}: " + "; ".join(v) for s, v in parts.items())
     print("\n" + headline)
     if args.no_wandb:
         return
@@ -257,7 +305,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="output/attend/manhattan")
     ap.add_argument("--seed", default="seed1234")
-    ap.add_argument("--variants", nargs="*", default=["nextlat", "learned"])
+    ap.add_argument("--variants", nargs="*", default=["nextlat", "learned"], help="runs to evaluate")
+    ap.add_argument("--compare", nargs="*", default=[],
+                    help="extra runs for the table only (already evaluated; checkpoints may be gone)")
+    ap.add_argument("--reference", nargs="*", default=None,
+                    help="variants every other variant is paired-tested against (default: the first)")
     ap.add_argument("--steps", nargs="+", default=["100000", "150000", "200000", "final"])
     ap.add_argument("--compression-steps", nargs="*", default=["150000", "200000"])
     ap.add_argument("--final-full", nargs="*", default=[])
@@ -278,6 +330,7 @@ def main():
         log(f"{len(jobs)} jobs: {jobs}")
         run_pool(args, runs, jobs)
         log("all jobs finished")
+    runs = [(v, os.path.join(args.root, v, args.seed)) for v in args.compare] + runs
     if args.wait_for:  # e.g. finish_manhattan.py's table: the final standard evals (compression, rank)
         deadline = time.time() + 8 * 3600
         while not os.path.isfile(args.wait_for) and time.time() < deadline:

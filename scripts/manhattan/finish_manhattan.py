@@ -42,9 +42,15 @@ EVAL_KEYS = [
 
 
 def final_checkpoint(exp_dir):
+    """Last checkpoint; for a run copied back without checkpoints, the last one with a standard
+    eval (its metrics.json is reused, so the missing file is never needed)."""
     ckpts = glob.glob(os.path.join(exp_dir, "ckpt_iter_*.pt"))
     step = lambda p: int(re.search(r"ckpt_iter_(\d+)\.pt$", p).group(1))
-    return max(ckpts, key=step) if ckpts else None
+    if ckpts:
+        return max(ckpts, key=step)
+    evaluated = [int(m.group(1)) for d in glob.glob(os.path.join(exp_dir, "manhattan_eval_ckpt_iter_*", "metrics.json"))
+                 if (m := re.search(r"manhattan_eval_ckpt_iter_(\d+)/metrics\.json$", d))]
+    return os.path.join(exp_dir, f"ckpt_iter_{max(evaluated)}.pt") if evaluated else None
 
 
 def main():
@@ -69,6 +75,10 @@ def main():
             continue
         exp_dir = os.path.dirname(glob.glob(os.path.join(run_dir, "*", "materialized_config.yaml"))[0])
         ckpt = final_checkpoint(exp_dir)
+        if ckpt is None:
+            print(f"[skip] {run_dir}: no checkpoint or eval results")
+            skipped.append(f"{variant}/{seed}")
+            continue
         suffix = "_quick" if args.quick else ""
         metrics_path = os.path.join(exp_dir, f"manhattan_eval_{os.path.basename(ckpt)[:-3]}{suffix}", "metrics.json")
         running = os.path.join(os.path.dirname(metrics_path), "RUNNING")
