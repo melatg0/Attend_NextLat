@@ -85,6 +85,7 @@ class CausalSelfAttention(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_head_outputs: bool = False,
     ) -> torch.Tensor:
         # input should have shape (batch_size, seq_len, n_embd)
         B, T, C = x.size()
@@ -124,12 +125,14 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).reshape(
-            B, T, C
-        )  # re-assemble all head outputs side by side
+        # Pre-output-projection values remain separated by attention head.
+        head_outputs = y.transpose(1, 2)  # (B, T, n_head, d_head)
+        y = head_outputs.reshape(B, T, C)
 
-        # output projection
+        # output projection (unchanged for existing callers)
         y = self.resid_dropout(self.c_proj(y))
+        if return_head_outputs:
+            return y, head_outputs
         return y
 
 
@@ -170,9 +173,18 @@ class Block(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_head_outputs: bool = False,
     ) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x), mask=mask, rope=rope)
+        attn_result = self.attn(
+            self.ln_1(x), mask=mask, rope=rope,
+            return_head_outputs=return_head_outputs,
+        )
+        if return_head_outputs:
+            attn_result, head_outputs = attn_result
+        x = x + attn_result
         x = x + self.mlp(self.ln_2(x))
+        if return_head_outputs:
+            return x, head_outputs
         return x
 
 
