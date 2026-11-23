@@ -129,3 +129,11 @@ compression + effective rank, then tabulates them next to val/nsl1 with a McNema
 Paired detours (detour_test.py --paired) seed each trial separately, so all models get the same trips
 and detour decisions; the default global RNG drifts apart with each model's path lengths. Compression
 trials are already shared across models (prefixes come from numpy before the model samples with torch).
+
+Manhattan results, seed 1234, 255k steps (local copy: output/results/manhattan_seed1234/)
+=========================================================================================
+Standard evals tie: valid trips 96.5% (nextlat) vs 96.3% (learned), compression 0.59 both, next-token
+loss 0.7292 vs 0.7293. Over training (paired 1,000-trial detours), learned has 20-25% lower val/nsl1
+at every checkpoint, but its effective rank stays ~125 while nextlat's falls 97 -> 83, and its detour
+validity trails by 5.6 points at 100k and 2-3 points from 150k to 255k (88.4% vs 85.5%, McNemar
+p = 0.048). Training took 25.8 h (nextlat) and 29.3 h (learned) on one H100 NVL each.
